@@ -26,6 +26,20 @@ const (
 	qwenUserAgent       = "QwenCode/0.10.3 (darwin; arm64)"
 	qwenRateLimitPerMin = 60          // 60 requests per minute per credential
 	qwenRateLimitWindow = time.Minute // sliding window duration
+
+	// waitForQwenRateLimit configuration:
+	// Instead of failing immediately with 429 when the rate limit is hit,
+	// we transparently wait until a slot becomes available. This prevents
+	// upstream callers (like OpenClaw) from seeing spurious 429s and
+	// permanently marking credentials as quota-exhausted.
+	qwenRateLimitPollInterval = 500 * time.Millisecond // how often to re-check for a free slot
+	qwenRateLimitMaxWait      = 90 * time.Second       // max time to wait for a slot (> 60s window)
+
+	// Per-minute rate limit retry cooldown (NOT daily quota).
+	// When Qwen returns "Free allocated quota exceeded" / HTTP 429,
+	// this is a per-minute rate limit, not a daily quota issue.
+	// Use a short retry interval (65s) instead of cooling until tomorrow.
+	qwenPerMinuteRetryAfter = 65 * time.Second
 )
 
 // qwenBeijingLoc caches the Beijing timezone to avoid repeated LoadLocation syscalls.
@@ -38,10 +52,19 @@ var qwenBeijingLoc = func() *time.Location {
 	return loc
 }()
 
-// qwenQuotaCodes is a package-level set of error codes that indicate quota exhaustion.
-var qwenQuotaCodes = map[string]struct{}{
+// qwenDailyQuotaCodes identifies error codes that indicate DAILY quota exhaustion.
+// These should trigger a long cooldown until the next day (midnight Beijing time).
+// IMPORTANT: Do NOT include rate-limit codes here. Per-minute rate limits
+// ("Free allocated quota exceeded", HTTP 429) are handled separately with
+// a short retry interval.
+var qwenDailyQuotaCodes = map[string]struct{}{
 	"insufficient_quota": {},
-	"quota_exceeded":     {},
+}
+
+// qwenRateLimitCodes identifies error codes that indicate per-minute rate limiting.
+// These should trigger a short retry (65s) instead of a daily cooldown.
+var qwenRateLimitCodes = map[string]struct{}{
+	"quota_exceeded": {},
 }
 
 // qwenRateLimiter tracks request timestamps per credential for rate limiting.
@@ -65,97 +88,187 @@ func redactAuthID(id string) string {
 	return id[:4] + "..." + id[len(id)-4:]
 }
 
-// checkQwenRateLimit checks if the credential has exceeded the rate limit.
-// Returns nil if allowed, or a statusErr with retryAfter if rate limited.
-func checkQwenRateLimit(authID string) error {
+// waitForQwenRateLimit transparently waits until a rate-limit slot is available
+// for the given credential, then records the request and returns.
+// Instead of returning a 429 error immediately (which causes upstream callers
+// like OpenClaw to permanently mark credentials as quota-exhausted), this
+// function blocks until a slot opens up within the sliding window.
+//
+// Returns nil on success, or a context error / timeout error if the wait
+// exceeds qwenRateLimitMaxWait or the context is cancelled.
+func waitForQwenRateLimit(ctx context.Context, authID string) error {
 	if authID == "" {
-		// Empty authID should not bypass rate limiting in production
-		// Use debug level to avoid log spam for certain auth flows
 		log.Debug("qwen rate limit check: empty authID, skipping rate limit")
 		return nil
 	}
 
-	now := time.Now()
-	windowStart := now.Add(-qwenRateLimitWindow)
+	deadline := time.Now().Add(qwenRateLimitMaxWait)
 
-	qwenRateLimiter.Lock()
-	defer qwenRateLimiter.Unlock()
-
-	// Get and filter timestamps within the window
-	timestamps := qwenRateLimiter.requests[authID]
-	var validTimestamps []time.Time
-	for _, ts := range timestamps {
-		if ts.After(windowStart) {
-			validTimestamps = append(validTimestamps, ts)
+	for {
+		now := time.Now()
+		if now.After(deadline) {
+			// Timed out waiting for a slot — return a short retryAfter so the
+			// conductor doesn't kill the credential for hours.
+			shortRetry := qwenPerMinuteRetryAfter
+			log.Warnf("qwen rate limit: wait timeout after %v for credential %s", qwenRateLimitMaxWait, redactAuthID(authID))
+			return statusErr{
+				code:       http.StatusTooManyRequests,
+				msg:        fmt.Sprintf(`{"error":{"code":"rate_limit_exceeded","message":"Qwen rate limit: %d requests/minute exceeded, waited %v. Retrying shortly.","type":"rate_limit_exceeded"}}`, qwenRateLimitPerMin, qwenRateLimitMaxWait),
+				retryAfter: &shortRetry,
+			}
 		}
-	}
 
-	// Always prune expired entries to prevent memory leak
-	// Delete empty entries, otherwise update with pruned slice
-	if len(validTimestamps) == 0 {
-		delete(qwenRateLimiter.requests, authID)
-	}
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 
-	// Check if rate limit exceeded
-	if len(validTimestamps) >= qwenRateLimitPerMin {
-		// Calculate when the oldest request will expire
+		windowStart := now.Add(-qwenRateLimitWindow)
+
+		qwenRateLimiter.Lock()
+
+		// Prune expired timestamps
+		timestamps := qwenRateLimiter.requests[authID]
+		var validTimestamps []time.Time
+		for _, ts := range timestamps {
+			if ts.After(windowStart) {
+				validTimestamps = append(validTimestamps, ts)
+			}
+		}
+
+		// Clean up empty entries
+		if len(validTimestamps) == 0 {
+			delete(qwenRateLimiter.requests, authID)
+		}
+
+		// If under the limit, record and proceed
+		if len(validTimestamps) < qwenRateLimitPerMin {
+			validTimestamps = append(validTimestamps, now)
+			qwenRateLimiter.requests[authID] = validTimestamps
+			qwenRateLimiter.Unlock()
+			return nil
+		}
+
+		// Rate limited: calculate how long until the oldest request expires
 		oldestInWindow := validTimestamps[0]
-		retryAfter := oldestInWindow.Add(qwenRateLimitWindow).Sub(now)
-		if retryAfter < time.Second {
-			retryAfter = time.Second
+		waitDuration := oldestInWindow.Add(qwenRateLimitWindow).Sub(now)
+		if waitDuration < qwenRateLimitPollInterval {
+			waitDuration = qwenRateLimitPollInterval
 		}
-		retryAfterSec := int(retryAfter.Seconds())
-		return statusErr{
-			code:       http.StatusTooManyRequests,
-			msg:        fmt.Sprintf(`{"error":{"code":"rate_limit_exceeded","message":"Qwen rate limit: %d requests/minute exceeded, retry after %ds","type":"rate_limit_exceeded"}}`, qwenRateLimitPerMin, retryAfterSec),
-			retryAfter: &retryAfter,
+
+		qwenRateLimiter.Unlock()
+
+		log.Debugf("qwen rate limit: credential %s at %d/%d requests, waiting %v for slot",
+			redactAuthID(authID), len(validTimestamps), qwenRateLimitPerMin, waitDuration)
+
+		// Wait with context cancellation support
+		timer := time.NewTimer(waitDuration)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+			// Retry the loop
 		}
 	}
-
-	// Record this request and update the map with pruned timestamps
-	validTimestamps = append(validTimestamps, now)
-	qwenRateLimiter.requests[authID] = validTimestamps
-
-	return nil
 }
 
-// isQwenQuotaError checks if the error response indicates a quota exceeded error.
-// Qwen returns HTTP 403 with error.code="insufficient_quota" when daily quota is exhausted.
-func isQwenQuotaError(body []byte) bool {
+// isQwenDailyQuotaError checks if the error response indicates a DAILY quota
+// exhaustion (not per-minute rate limiting). Only matches true daily quota
+// errors like HTTP 403 + "insufficient_quota".
+func isQwenDailyQuotaError(body []byte) bool {
 	code := strings.ToLower(gjson.GetBytes(body, "error.code").String())
 	errType := strings.ToLower(gjson.GetBytes(body, "error.type").String())
 
-	// Primary check: exact match on error.code or error.type (most reliable)
-	if _, ok := qwenQuotaCodes[code]; ok {
+	// Primary check: exact match on error.code or error.type
+	if _, ok := qwenDailyQuotaCodes[code]; ok {
 		return true
 	}
-	if _, ok := qwenQuotaCodes[errType]; ok {
+	if _, ok := qwenDailyQuotaCodes[errType]; ok {
 		return true
 	}
 
-	// Fallback: check message only if code/type don't match (less reliable)
+	// Fallback: check message for DAILY quota indicators only
+	// IMPORTANT: "free allocated quota exceeded" is a per-minute rate limit,
+	// NOT a daily quota issue. Do NOT match it here.
 	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
-	if strings.Contains(msg, "insufficient_quota") || strings.Contains(msg, "quota exceeded") ||
-		strings.Contains(msg, "free allocated quota exceeded") {
+	if strings.Contains(msg, "insufficient_quota") {
 		return true
 	}
 
 	return false
 }
 
-// wrapQwenError wraps an HTTP error response, detecting quota errors and mapping them to 429.
-// Returns the appropriate status code and retryAfter duration for statusErr.
-// Only checks for quota errors when httpCode is 403 or 429 to avoid false positives.
+// isQwenRateLimitError checks if the error response indicates a per-minute
+// rate limit (not daily quota exhaustion). These errors should get a short
+// retry interval (~65 seconds) instead of cooling until tomorrow.
+func isQwenRateLimitError(body []byte) bool {
+	code := strings.ToLower(gjson.GetBytes(body, "error.code").String())
+	errType := strings.ToLower(gjson.GetBytes(body, "error.type").String())
+
+	// Check known rate limit codes
+	if _, ok := qwenRateLimitCodes[code]; ok {
+		return true
+	}
+	if _, ok := qwenRateLimitCodes[errType]; ok {
+		return true
+	}
+
+	// "Free allocated quota exceeded" and "quota exceeded" are per-minute rate limits
+	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	if strings.Contains(msg, "free allocated quota exceeded") ||
+		strings.Contains(msg, "quota exceeded") ||
+		strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "too many requests") {
+		return true
+	}
+
+	return false
+}
+
+// wrapQwenError wraps an HTTP error response, distinguishing between:
+// 1. Daily quota exhaustion (HTTP 403 + "insufficient_quota") → cool until tomorrow
+// 2. Per-minute rate limiting (HTTP 429 + "Free allocated quota exceeded") → short 65s retry
+// 3. Other errors → pass through unchanged
+//
+// CRITICAL FIX: Previously, "Free allocated quota exceeded" (a per-minute rate limit)
+// was treated as daily quota exhaustion, causing credentials to be killed for hours.
+// Now it correctly gets a 65-second retry interval.
 func wrapQwenError(ctx context.Context, httpCode int, body []byte) (errCode int, retryAfter *time.Duration) {
 	errCode = httpCode
-	// Only check quota errors for expected status codes to avoid false positives
-	// Qwen returns 403 for quota errors, 429 for rate limits
-	if (httpCode == http.StatusForbidden || httpCode == http.StatusTooManyRequests) && isQwenQuotaError(body) {
-		errCode = http.StatusTooManyRequests // Map to 429 to trigger quota logic
+
+	// Only inspect quota/rate-limit errors for expected status codes
+	if httpCode != http.StatusForbidden && httpCode != http.StatusTooManyRequests {
+		return errCode, retryAfter
+	}
+
+	// Check for DAILY quota exhaustion first (HTTP 403 + insufficient_quota)
+	if isQwenDailyQuotaError(body) {
+		errCode = http.StatusTooManyRequests
 		cooldown := timeUntilNextDay()
 		retryAfter = &cooldown
-		logWithRequestID(ctx).Warnf("qwen quota exceeded (http %d -> %d), cooling down until tomorrow (%v)", httpCode, errCode, cooldown)
+		logWithRequestID(ctx).Warnf("qwen DAILY quota exhausted (http %d -> %d), cooling down until tomorrow (%v)", httpCode, errCode, cooldown)
+		return errCode, retryAfter
 	}
+
+	// Check for per-minute rate limiting (HTTP 429 + "Free allocated quota exceeded" etc.)
+	if isQwenRateLimitError(body) {
+		errCode = http.StatusTooManyRequests
+		shortRetry := qwenPerMinuteRetryAfter
+		retryAfter = &shortRetry
+		logWithRequestID(ctx).Infof("qwen per-minute rate limit hit (http %d), short retry in %v", httpCode, shortRetry)
+		return errCode, retryAfter
+	}
+
+	// Unknown 429/403 error — treat as a short transient error
+	if httpCode == http.StatusTooManyRequests {
+		shortRetry := qwenPerMinuteRetryAfter
+		retryAfter = &shortRetry
+		logWithRequestID(ctx).Infof("qwen unknown 429 error, short retry in %v", shortRetry)
+	}
+
 	return errCode, retryAfter
 }
 
@@ -211,13 +324,13 @@ func (e *QwenExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
 
-	// Check rate limit before proceeding
+	// Wait for rate limit slot (blocks transparently instead of failing with 429)
 	var authID string
 	if auth != nil {
 		authID = auth.ID
 	}
-	if err := checkQwenRateLimit(authID); err != nil {
-		logWithRequestID(ctx).Warnf("qwen rate limit exceeded for credential %s", redactAuthID(authID))
+	if err := waitForQwenRateLimit(ctx, authID); err != nil {
+		logWithRequestID(ctx).Warnf("qwen rate limit wait failed for credential %s: %v", redactAuthID(authID), err)
 		return resp, err
 	}
 
@@ -314,13 +427,13 @@ func (e *QwenExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
 
-	// Check rate limit before proceeding
+	// Wait for rate limit slot (blocks transparently instead of failing with 429)
 	var authID string
 	if auth != nil {
 		authID = auth.ID
 	}
-	if err := checkQwenRateLimit(authID); err != nil {
-		logWithRequestID(ctx).Warnf("qwen rate limit exceeded for credential %s", redactAuthID(authID))
+	if err := waitForQwenRateLimit(ctx, authID); err != nil {
+		logWithRequestID(ctx).Warnf("qwen rate limit wait failed for credential %s: %v", redactAuthID(authID), err)
 		return nil, err
 	}
 
