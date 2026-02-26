@@ -33,7 +33,7 @@ const (
 	// upstream callers (like OpenClaw) from seeing spurious 429s and
 	// permanently marking credentials as quota-exhausted.
 	qwenRateLimitPollInterval = 500 * time.Millisecond // how often to re-check for a free slot
-	qwenRateLimitMaxWait      = 90 * time.Second       // max time to wait for a slot (> 60s window)
+	qwenRateLimitMaxWait      = 120 * time.Second      // max time to wait for a slot (2× the 60s window)
 
 	// Per-minute rate limit retry cooldown (NOT daily quota).
 	// When Qwen returns "Free allocated quota exceeded" / HTTP 429,

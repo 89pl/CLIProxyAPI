@@ -1270,6 +1270,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					backoffLevel := state.Quota.BackoffLevel
 					if result.RetryAfter != nil {
 						next = now.Add(*result.RetryAfter)
+						// When an explicit RetryAfter is provided (e.g. per-minute
+						// rate limits from Qwen), this is a short, bounded cooldown —
+						// NOT a sign of escalating quota exhaustion.  Reset the
+						// backoff level so subsequent hits don't snowball into
+						// multi-minute suspensions that permanently deadlock when
+						// there is only one credential.
+						backoffLevel = 0
 					} else {
 						cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
 						if cooldown > 0 {
@@ -1547,6 +1554,10 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		var next time.Time
 		if retryAfter != nil {
 			next = now.Add(*retryAfter)
+			// Explicit RetryAfter → per-minute rate limit, not escalating
+			// quota exhaustion.  Reset backoff to prevent permanent deadlock
+			// when only one credential is available.
+			auth.Quota.BackoffLevel = 0
 		} else {
 			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, quotaCooldownDisabledForAuth(auth))
 			if cooldown > 0 {
